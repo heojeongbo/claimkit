@@ -8,11 +8,18 @@ import (
 	"time"
 )
 
-// Reservation is a single-use handoff to a specific Owner. Token explicitly
+// Reservation is a single-use handoff with an optional Owner binding. Token explicitly
 // exposes its bearer capability for transport; keep it confidential. Default
 // formatting, slog, and JSON encoding do not include the token. Cancelling an
 // abandoned reservation is optional: it expires after its TTL once available.
+// Retain the pointer returned by BeginTransfer or Transfer for lifecycle calls.
 type Reservation struct {
+	// The handle is immutable so value-receiver redaction can safely copy it
+	// while the prior holder releases and starts the reservation's timer.
+	*reservationState
+}
+
+type reservationState struct {
 	r            *Resource
 	token        string
 	info         ReservationInfo
@@ -98,7 +105,7 @@ func (r *Resource) BeginTransfer(ctx context.Context, opts TransferOptions) (*Re
 		return nil, ErrReserved
 	}
 	r.clearReservationLocked()
-	p := &Reservation{r: r, token: rand.Text(), ttl: opts.TTL, logctx: context.WithoutCancel(ctx), previous: r.current}
+	p := &Reservation{reservationState: &reservationState{r: r, token: rand.Text(), ttl: opts.TTL, logctx: context.WithoutCancel(ctx), previous: r.current}}
 	if opts.Next != nil {
 		p.bound = true
 		p.info.Owner = *opts.Next

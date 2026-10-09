@@ -60,3 +60,23 @@ Median at GOMAXPROCS=4:
 | Contended | 403.7 | 545 | 5 |
 | Transfer | 861 | 1184 | 14 |
 | Logging | 2044 | 1088 | 11 |
+
+## v0.1.1 reservation formatting fix
+
+The same Linux devcontainer check, 25 race runs and benchmark command passed
+for v0.1.1. Coverage remains 100%. A pending reservation now has an immutable
+handle around its mutable state, so `fmt` and `slog` redaction cannot race the
+previous holder's release. This adds one small allocation to a handoff.
+
+Median of three GOMAXPROCS=4 runs (other host workloads may affect timings):
+
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | ---: | ---: | ---: |
+| AcquireRelease | 471.9 | 720 | 7 |
+| AcquireReleaseTTL | 644.8 | 848 | 9 |
+| Occupied | 40.46 | 0 | 0 |
+| Check | 3.952 | 0 | 0 |
+| Observe | 89.58 | 160 | 1 |
+| Contended | 405.5 | 504 | 4 |
+| Transfer | 884.7 | 1192 | 15 |
+| Logging | 2356 | 1088 | 11 |
