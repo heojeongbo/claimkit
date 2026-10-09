@@ -21,11 +21,11 @@ type Resource struct {
 	pending  *Reservation
 	closed   bool
 	revision uint64
+	sequence uint64
 	changed  chan struct{}
 }
 
-// New constructs a resource. No goroutine starts until a timed claim or
-// reservation is created. The caller chooses the scope and name of the resource.
+// New constructs a resource without starting background work.
 func New(name string, opts Options) *Resource {
 	return &Resource{name: name, opts: opts, changed: make(chan struct{})}
 }
@@ -33,37 +33,38 @@ func New(name string, opts Options) *Resource {
 // Acquire immediately attempts ownership; it never queues. ctx controls this
 // attempt and carries logging values, NOT the lifetime of the resulting claim.
 // The holder must observe Claim.Done and Release after its work has stopped.
-func (r *Resource) Acquire(ctx context.Context, owner Owner, opts AcquireOptions) (*Claim, error) {
+func (r *Resource) Acquire(ctx context.Context, owner Owner, opts AcquireOptions) (claim *Claim, err error) {
+	var events []emission
+	r.mu.Lock()
+	defer r.finish(&events)
+	defer func() {
+		if err != nil {
+			r.recordLocked(ctx, EventAcquireRejected, r.current, r.pending, owner, "", err, &events)
+		}
+	}()
 	if opts.TTL < 0 {
 		return nil, ErrInvalidTTL
 	}
-	r.mu.Lock()
 	if err := ctx.Err(); err != nil {
-		r.mu.Unlock()
 		return nil, err
 	}
 	if r.closed {
-		r.mu.Unlock()
 		return nil, ErrClosed
 	}
-	r.expireReservationLocked(time.Now())
+	r.expireLocked(&events)
 	if r.current != nil {
-		r.mu.Unlock()
-		return nil, ErrOccupied
+		return nil, r.conflictLocked("acquire", "", ErrOccupied)
 	}
 	if r.pending != nil {
 		if opts.Token == "" {
-			r.mu.Unlock()
-			return nil, ErrReserved
+			return nil, r.conflictLocked("acquire", "", ErrReserved)
 		}
-		if subtle.ConstantTimeCompare([]byte(r.pending.token), []byte(opts.Token)) != 1 || (r.pending.bound && r.pending.info.Owner != owner) {
-			r.mu.Unlock()
-			return nil, ErrInvalidToken
+		if subtle.ConstantTimeCompare([]byte(r.pending.token), []byte(opts.Token)) != 1 || (r.pending.info.OwnerBound && r.pending.info.Owner != owner) {
+			return nil, r.conflictLocked("acquire", "", ErrInvalidToken)
 		}
-		r.clearReservationLocked()
+		r.pending.endLocked(ctx, ReservationConsumed, EventReservationConsumed, ErrReservationConsumed, &events)
 	} else if opts.Token != "" {
-		r.mu.Unlock()
-		return nil, ErrInvalidToken
+		return nil, r.conflictLocked("acquire", "", ErrInvalidToken)
 	}
 	c := &Claim{
 		r:    r,
@@ -76,21 +77,23 @@ func (r *Resource) Acquire(ctx context.Context, owner Owner, opts AcquireOptions
 		c.armLocked(opts.TTL)
 	}
 	r.notifyLocked()
-	revision := r.revision
-	r.mu.Unlock()
-	r.log(ctx, "acquired", c.info.ID, revision, nil, owner, "")
+	r.recordLocked(ctx, EventAcquired, c, nil, owner, "", nil, &events)
 	return c, nil
 }
 
-// Observe atomically returns a snapshot and an invalidation channel. On channel
-// closure, call Observe again to get the latest state. Updates may coalesce;
-// this is a state subscription, not an audit stream. There are no per-subscriber
-// goroutines and no unsubscribe call. Stop observing when Snapshot.Closed is
-// true, or when your own context ends.
+// Observe atomically returns a detached snapshot and an invalidation channel.
+// On closure, call Observe again. Changes may coalesce; this is a latest-state
+// subscription, not an event stream. No per-subscriber goroutine is created.
+// Stop when Snapshot.Closed is true or your own context ends.
 func (r *Resource) Observe() (Snapshot, <-chan struct{}) {
+	var events []emission
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.expireReservationLocked(time.Now())
+	defer r.finish(&events)
+	r.expireLocked(&events)
+	return r.snapshotLocked(), r.changed
+}
+
+func (r *Resource) snapshotLocked() Snapshot {
 	s := Snapshot{Resource: r.name, Revision: r.revision, Closed: r.closed}
 	if r.current != nil {
 		info := r.current.infoLocked()
@@ -100,70 +103,105 @@ func (r *Resource) Observe() (Snapshot, <-chan struct{}) {
 		info := r.pending.info
 		s.Reservation = &info
 	}
-	return s, r.changed
+	return s
 }
 
-// Revoke signals the current claim and waits for that specific holder's Release.
-// It does not reserve the next acquisition. Use Transfer for a protected handoff.
-// Authorization is the application's responsibility. A timeout leaves revocation
-// in effect and wraps both ErrNotReleased and the context error.
+// Revoke requests cleanup of the current holder and waits for its Release.
+// It reserves no successor. Authorization belongs to the application. A timeout
+// leaves revocation in effect and wraps ErrNotReleased and the context error.
 func (r *Resource) Revoke(ctx context.Context, reason string) error {
-	r.mu.Lock()
-	if err := ctx.Err(); err != nil {
-		r.mu.Unlock()
+	return r.RevokeWithOptions(ctx, RevokeOptions{Reason: reason})
+}
+
+// RevokeWithOptions compares ExpectedClaimID and requests cleanup atomically.
+// Observing one claim and revoking with that ID cannot revoke a newer one.
+func (r *Resource) RevokeWithOptions(ctx context.Context, opts RevokeOptions) error {
+	c, err := r.requestRevoke(ctx, opts)
+	if err != nil {
 		return err
 	}
-	if r.closed {
-		r.mu.Unlock()
-		return ErrClosed
-	}
-	r.expireReservationLocked(time.Now())
-	if r.pending != nil {
-		r.mu.Unlock()
-		return ErrReserved
-	}
-	c := r.current
 	if c == nil {
-		r.mu.Unlock()
 		return nil
-	}
-	changed := c.invalidateLocked(ErrRevoked, reason)
-	revision := r.revision
-	r.mu.Unlock()
-	if changed {
-		r.log(ctx, "revoked", c.info.ID, revision, ErrRevoked, c.info.Owner, reason)
 	}
 	return waitReleased(ctx, c.released)
 }
 
-// Close permanently rejects new acquisitions, cancels reservations, signals any
-// holder, and waits for cleanup. It is idempotent and may be called again after
-// a timeout. It never forces release of live work.
-func (r *Resource) Close(ctx context.Context) error {
+func (r *Resource) requestRevoke(ctx context.Context, opts RevokeOptions) (claim *Claim, err error) {
+	var events []emission
 	r.mu.Lock()
+	defer r.finish(&events)
+	defer func() {
+		if err != nil {
+			r.recordLocked(ctx, EventRevokeRejected, r.current, r.pending, Owner{}, opts.ExpectedClaimID, err, &events)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
-		r.mu.Unlock()
-		return err
+		return nil, err
 	}
-	first := !r.closed
-	r.closed = true
-	r.clearReservationLocked()
+	if r.closed {
+		return nil, ErrClosed
+	}
+	r.expireLocked(&events)
+	if !r.matchesLocked(opts.ExpectedClaimID) {
+		return nil, r.conflictLocked("revoke", opts.ExpectedClaimID, ErrConflict)
+	}
+	if r.pending != nil {
+		return nil, r.conflictLocked("revoke", opts.ExpectedClaimID, ErrReserved)
+	}
 	c := r.current
 	if c != nil {
-		c.invalidateLocked(ErrClosed, "resource closed")
+		c.invalidateLocked(ctx, ErrRevoked, CauseRevoked, opts.Reason, EventRevoked, time.Now(), &events)
 	}
-	if first {
-		r.notifyLocked()
-	}
-	revision := r.revision
-	r.mu.Unlock()
-	if first {
-		r.log(ctx, "closed", "", revision, nil, Owner{}, "resource closed")
+	return c, nil
+}
+
+func (r *Resource) matchesLocked(id string) bool {
+	return id == "" || (r.current != nil && r.current.info.ID == id)
+}
+
+// Close permanently rejects acquisitions, ends reservations and requests holder
+// cleanup. It is retryable after a timeout and never releases live work itself.
+func (r *Resource) Close(ctx context.Context) error {
+	c, err := r.beginClose(ctx)
+	if err != nil {
+		return err
 	}
 	if c != nil {
 		return waitReleased(ctx, c.released)
 	}
 	return nil
+}
+
+func (r *Resource) beginClose(ctx context.Context) (*Claim, error) {
+	var events []emission
+	r.mu.Lock()
+	defer r.finish(&events)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.expireLocked(&events)
+	first := !r.closed
+	r.closed = true
+	if r.pending != nil {
+		r.pending.endLocked(ctx, ReservationClosed, EventReservationClosed, ErrClosed, &events)
+	}
+	c := r.current
+	if c != nil {
+		c.invalidateLocked(ctx, ErrClosed, CauseClosed, "resource closed", EventClaimClosed, time.Now(), &events)
+	}
+	if first {
+		r.notifyLocked()
+		r.recordLocked(ctx, EventClosed, c, nil, Owner{}, "", nil, &events)
+	}
+	return c, nil
+}
+
+func (r *Resource) expireLocked(events *[]emission) {
+	now := time.Now()
+	if r.current != nil {
+		r.current.expireLocked(events)
+	}
+	r.expireReservationLocked(now, events)
 }
 
 func (r *Resource) notifyLocked() {
@@ -177,7 +215,6 @@ func waitReleased(ctx context.Context, released <-chan struct{}) error {
 	case <-released:
 	case <-ctx.Done():
 	}
-	// Completion wins a simultaneous cancellation.
 	select {
 	case <-released:
 		return nil

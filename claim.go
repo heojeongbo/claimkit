@@ -17,11 +17,12 @@ type Claim struct {
 	cause    error
 	timer    *time.Timer
 	logctx   context.Context
+	lifetime context.Context // allocated only when Context is used
+	end      context.CancelCauseFunc
 }
 
-// Done closes on revocation, expiry, resource shutdown, or voluntary Release.
-// The holder should stop accepting work, cancel and join outstanding work, and
-// then Release. Listening after revocation is safe; the signal cannot be missed.
+// Done closes on revocation, expiry, shutdown, or voluntary Release. The holder
+// must stop accepting work, cancel and join outstanding work, then Release.
 func (c *Claim) Done() <-chan struct{} { return c.done }
 
 // Released closes only after Release, unlike Done which requests cleanup.
@@ -29,8 +30,10 @@ func (c *Claim) Released() <-chan struct{} { return c.released }
 
 // Info returns a detached snapshot of this acquisition, even after release.
 func (c *Claim) Info() ClaimInfo {
+	var events []emission
 	c.r.mu.Lock()
-	defer c.r.mu.Unlock()
+	defer c.r.finish(&events)
+	c.expireLocked(&events)
 	return c.infoLocked()
 }
 
@@ -40,17 +43,38 @@ func (c *Claim) infoLocked() ClaimInfo {
 	return info
 }
 
-// Check reports whether this acquisition can still accept work. Expiration is
-// checked against the deadline even if the timer has not run yet. The first
-// terminal cause is preserved. Checking does not serialize subsequent work with
-// revocation; the holder must cancel/join in-flight work before Release.
+// Check reports whether this acquisition can accept work, reconciling overdue
+// timers. The first terminal cause is preserved. This does not serialize later
+// work with revocation; cancel/join in-flight work before Release.
 func (c *Claim) Check() error {
+	var events []emission
 	c.r.mu.Lock()
-	defer c.r.mu.Unlock()
-	if c.cause == nil && !c.info.ExpiresAt.IsZero() && !time.Now().Before(c.info.ExpiresAt) {
-		return ErrExpired
-	}
+	defer c.r.finish(&events)
+	c.expireLocked(&events)
 	return c.cause
+}
+
+// Context derives work from parent and cancels it when this claim ends. Values
+// and deadlines come from parent; context.Cause reports whichever cancellation
+// wins. Always call the returned cancel function to unregister the hook. Neither
+// parent cancellation nor this function releases ownership: join work and Release.
+func (c *Claim) Context(parent context.Context) (context.Context, context.CancelFunc) {
+	var events []emission
+	c.r.mu.Lock()
+	defer c.r.finish(&events)
+	c.expireLocked(&events)
+	if c.lifetime == nil {
+		c.lifetime, c.end = context.WithCancelCause(context.Background())
+		if c.cause != nil {
+			c.end(c.cause)
+		}
+	}
+	child, cancel := context.WithCancelCause(parent)
+	stop := context.AfterFunc(c.lifetime, func() { cancel(context.Cause(c.lifetime)) })
+	if c.cause != nil {
+		cancel(c.cause)
+	}
+	return child, func() { stop(); cancel(context.Canceled) }
 }
 
 // Release confirms all work belonging to this acquisition has stopped. It
@@ -58,61 +82,57 @@ func (c *Claim) Check() error {
 // prevent cleanup. A stale release is harmless and returns false.
 func (c *Claim) Release(ctx context.Context) bool {
 	r := c.r
+	var events []emission
 	r.mu.Lock()
+	defer r.finish(&events)
 	if r.current != c {
-		r.mu.Unlock()
 		return false
 	}
-	if c.cause == nil && !c.info.ExpiresAt.IsZero() && !time.Now().Before(c.info.ExpiresAt) {
-		c.invalidateLocked(ErrExpired, "lease expired")
-	}
+	c.expireLocked(&events)
+	now := time.Now()
 	if c.cause == nil {
-		c.cause = ErrReleased
-		close(c.done)
+		c.cause, c.info.Cause, c.info.EndedAt = ErrReleased, CauseReleased, now
+		c.signalLocked()
 	}
 	if c.timer != nil {
 		c.timer.Stop()
 	}
-	c.info.ReleasedAt = time.Now()
+	c.info.ReleasedAt = now
 	close(c.released)
 	r.current = nil
-	if r.pending != nil {
-		r.pending.armLocked()
-	}
 	r.notifyLocked()
-	revision := r.revision
-	r.mu.Unlock()
-	r.log(ctx, "released", c.info.ID, revision, nil, c.info.Owner, c.info.Reason)
+	r.recordLocked(ctx, EventReleased, c, nil, Owner{}, "", nil, &events)
+	if r.pending != nil {
+		r.pending.armLocked(&events)
+	}
 	return true
 }
 
 // Renew replaces the active claim's deadline with now+ttl. It cannot revive a
-// revoked, expired, or released claim. ttl must be positive. Renewal is explicit;
-// applications choose heartbeat frequency, retry policy, and session lifetime.
-func (c *Claim) Renew(ctx context.Context, ttl time.Duration) error {
+// terminal claim. ttl must be positive; applications choose heartbeat policy.
+func (c *Claim) Renew(ctx context.Context, ttl time.Duration) (err error) {
+	r := c.r
+	var events []emission
+	r.mu.Lock()
+	defer r.finish(&events)
+	defer func() {
+		if err != nil {
+			r.recordLocked(ctx, EventRenewRejected, c, nil, Owner{}, "", err, &events)
+		}
+	}()
 	if ttl <= 0 {
 		return ErrInvalidTTL
 	}
-	r := c.r
-	r.mu.Lock()
 	if err := ctx.Err(); err != nil {
-		r.mu.Unlock()
 		return err
 	}
+	c.expireLocked(&events)
 	if c.cause != nil {
-		err := c.cause
-		r.mu.Unlock()
-		return err
-	}
-	if !c.info.ExpiresAt.IsZero() && !time.Now().Before(c.info.ExpiresAt) {
-		r.mu.Unlock()
-		return ErrExpired
+		return c.cause
 	}
 	c.armLocked(ttl)
 	r.notifyLocked()
-	revision := r.revision
-	r.mu.Unlock()
-	r.log(ctx, "renewed", c.info.ID, revision, nil, c.info.Owner, "")
+	r.recordLocked(ctx, EventRenewed, c, nil, Owner{}, "", nil, &events)
 	return nil
 }
 
@@ -125,29 +145,36 @@ func (c *Claim) armLocked(ttl time.Duration) {
 }
 
 func (c *Claim) expire() {
-	r := c.r
-	r.mu.Lock()
-	// A stopped timer may already be running. It must not invalidate a renewal
-	// or a later acquisition, nor overwrite the first terminal reason.
-	changed := c.cause == nil && !time.Now().Before(c.info.ExpiresAt) && c.invalidateLocked(ErrExpired, "lease expired")
-	revision := r.revision
-	r.mu.Unlock()
-	if changed {
-		r.log(c.logctx, "expired", c.info.ID, revision, ErrExpired, c.info.Owner, "lease expired")
+	var events []emission
+	c.r.mu.Lock()
+	defer c.r.finish(&events)
+	// A stopped timer may already be running; the current deadline and cause win.
+	c.expireLocked(&events)
+}
+
+func (c *Claim) expireLocked(events *[]emission) {
+	if c.cause == nil && !c.info.ExpiresAt.IsZero() && !time.Now().Before(c.info.ExpiresAt) {
+		c.invalidateLocked(c.logctx, ErrExpired, CauseExpired, "lease expired", EventExpired, c.info.ExpiresAt, events)
 	}
 }
 
-func (c *Claim) invalidateLocked(cause error, reason string) bool {
+func (c *Claim) invalidateLocked(ctx context.Context, cause error, code Cause, reason string, kind EventKind, at time.Time, events *[]emission) {
 	if c.cause != nil {
-		return false
+		return
 	}
-	c.cause = cause
-	c.info.Revoked = true
-	c.info.Reason = reason
+	c.cause, c.info.Cause, c.info.EndedAt = cause, code, at
+	c.info.Revoked, c.info.Reason = true, reason
 	if c.timer != nil {
 		c.timer.Stop()
 	}
-	close(c.done)
+	c.signalLocked()
 	c.r.notifyLocked()
-	return true
+	c.r.recordLocked(ctx, kind, c, nil, Owner{}, "", cause, events)
+}
+
+func (c *Claim) signalLocked() {
+	close(c.done)
+	if c.end != nil {
+		c.end(c.cause)
+	}
 }

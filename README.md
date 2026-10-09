@@ -42,12 +42,17 @@ An acquisition has two distinct endings:
 `Release` is idempotent and scoped to its acquisition. A late release from an
 old session cannot affect a new session, even for the same user. `Released()`
 lets other goroutines wait for cleanup completion. `Info()` includes timestamps,
-owner, session, custom metadata, and the first applied revocation reason.
+owner, session, custom metadata, and the first terminal `Cause`/`EndedAt`.
+`ReleasedAt` separately records cleanup completion.
 
 `Acquire`'s context controls the attempt and carries logging values; it does not
 automatically release or revoke the resulting claim. This allows a job to outlive
 an HTTP request. A session-oriented application should stop its work when either
 the session context or `Claim.Done()` ends, then release after joining that work.
+`work, cancel := c.Context(sessionCtx)` wires both cancellation sources and
+preserves parent values; always defer `cancel()` to unregister the hook.
+`context.Cause(work)` identifies the winning cause. This helper never releases
+ownership, including when the parent ends.
 
 ```go
 // The current holder must already be observing Done and releasing after cleanup.
@@ -76,8 +81,10 @@ and leaves revocation in effect; it never pretends that the old work stopped.
 
 Tokens are random, single-use, resource-bound capabilities, also bound to the
 specified owner and session. Stale tokens fail even when a resource is free.
-Only `Token()` deliberately exposes the secret. Snapshots, JSON encoding, normal
-formatting, and structured logs do not expose it. Authenticate owner/session
+`Reservation.Token()` and `AcquireOptions.Token` explicitly expose the secret.
+Snapshots and default JSON/formatting/slog of either wrapper omit the capability.
+Formatting/slog also omit acquisition metadata; JSON preserves metadata.
+Explicitly logging the token field, or copying it into metadata, bypasses this protection. Authenticate owner/session
 values at your transport boundary; do not accept them on trust from a client.
 
 `Revoke(ctx, reason)` stops the current acquisition without reserving its
@@ -94,6 +101,26 @@ waiter cannot withdraw a replacement. A reservation whose caller never calls
 Wait or Cancel can remain pending until the previous holder releases; callers
 must own this lifecycle. The ordinary `Transfer` helper waits automatically and
 continues to reject overlapping transfers.
+
+Reservations have a public `ID` distinct from their token. `Info()` tracks
+`waiting` → `ready` → `consumed`, or termination by cancellation, replacement,
+expiry, or shutdown, with creation/readiness/end timestamps. `Done()` closes only
+on termination; `Err()` matches `ErrReservationLost` and the specific cause.
+`Wait` returns promptly on termination, even if the previous holder is still
+cleaning up. A ready, live reservation wins simultaneous context cancellation;
+use `Cancel` explicitly to abandon it. Neither cancellation nor replacement
+releases the previous holder.
+
+For a takeover based on a displayed snapshot, set `ExpectedClaimID` on
+`RevokeWithOptions` or `BeginTransfer`. The comparison and transition are atomic.
+A mismatch, including a now-free resource, returns `ErrConflict` without touching
+the current holder or reservation. An empty expected ID is unconditional.
+
+Arbitration failures wrap `*ConflictError`: use `errors.As` to inspect
+`Operation`, `ExpectedClaimID`, and `Snapshot()`. The detached snapshot was
+captured at rejection, rather than through a later potentially stale read.
+`errors.Is` continues to match `ErrOccupied`, `ErrReserved`, `ErrInvalidToken`,
+and `ErrConflict`. Filter identities/metadata before exposing it to other users.
 
 ## Leases
 
@@ -127,6 +154,32 @@ may coalesce; this is a latest-state subscription, not an audit log. Observers
 create no library goroutines or subscriptions needing cleanup. Snapshots and
 metadata maps are detached copies. Revisions are local to this resource instance.
 
+## Lifecycle events
+
+```go
+r := claimkit.New("resource", claimkit.Options{
+    OnEvent: func(ctx context.Context, e claimkit.Event) {
+        // Emit metrics or enqueue into an application-owned audit pipeline.
+        record(e.Kind, e.Sequence, e.Revision, e.Claim, e.Reservation)
+    },
+})
+```
+
+Typed events cover acquisition/release, renewal, revocation, lease expiry,
+claim/resource shutdown, every reservation transition, and rejected
+acquire/renew/revoke/transfer attempts. Expiry discovered through a read emits
+the same one-time event as timer expiry. Repeated Wait/Release/Close calls do
+not repeat lifecycle events. Denials do not increment state revision.
+
+Payloads are captured under the resource mutex and delivered synchronously
+outside it. `Sequence` orders events within the instance; concurrent or reentrant
+callbacks may overlap or arrive out of order. Callbacks must be concurrency-safe,
+prompt, and must not panic: a panic propagates after state commit without rollback.
+A slow callback delays its operation/timer goroutine, but never holds the mutex.
+There is no internal queue, overflow policy, replay, or durable delivery; callers
+choose these in their own event sink. Events copy metadata and omit tokens.
+Keep `Observe` for inexpensive latest-state UI subscriptions.
+
 ## Customization and boundaries
 
 | Concern | Application extension point |
@@ -135,14 +188,16 @@ metadata maps are detached copies. Revisions are local to this resource instance
 | Identity | Assign arbitrary `Owner.ID` and `Owner.Session`; use an empty owner for unattributed local work |
 | Job attributes | Add copied string metadata, such as operation, job ID, or correlation ID |
 | Authentication and takeover policy | Authorize before calling Acquire, Revoke, or Transfer; wrap the concrete resource in your service |
-| Stop behavior | Observe `Claim.Done`; cancel transports, subprocesses, or jobs and join them before Release |
+| Stop behavior | Use `Claim.Context` or `Done`; join transports, subprocesses, or jobs before Release |
 | Session vs. background lifetime | Choose the work context independently of the acquisition request |
 | Expiration and renewal | Choose per-acquisition TTL and renewal schedule |
 | HTTP, gRPC, WebRTC, or CLI | Map errors and expose selected snapshot fields in your own transport |
 | Logs and tracing | Resolve any `slog.Logger` from the operation context |
+| Metrics and audit sinks | Handle typed `OnEvent` payloads and choose queue/storage policy externally |
+| Stale UI actions | Supply `ExpectedClaimID` for conditional revoke/transfer |
 | Existing distributed lease | Keep its authority in the existing backend; adapt its observed state at your application boundary |
 
-This initial package is a **single-process coordinator**. It does not implement
+This package is a **single-process coordinator**. It does not implement
 distributed consensus, persistent restart recovery, FIFO scheduling, multiple
 readers, hierarchical ownership, or atomic acquisition of multiple resources.
 There is no pluggable distributed backend contract yet. A durable store needs its
@@ -165,16 +220,32 @@ r := claimkit.New("resource", claimkit.Options{Logger: log.From})
 ```
 
 For plain slog, supply `func(context.Context) *slog.Logger { return logger }`.
-Nil disables logging. Records include component, resource, event, public claim
-ID, revision, owner/session, reason, and error. Renewal is debug-level; normal
-lifecycle events are info-level; revocation, expiry, and failed handoffs warn.
-Metadata and reservation capabilities are never logged by the library.
+Nil disables logging. Records include component, resource, event, sequence,
+revision, occurrence time, public claim/reservation IDs, holder and requester
+identity/session, expected claim ID, reason, and error. Renewals and request
+denials are debug-level; ordinary lifecycle events are info-level; claim
+invalidation (revocation, expiry, shutdown) warns. Metadata and reservation
+capabilities are never logged by the library.
 
-Resolvers/handlers run outside the resource mutex and must be concurrency-safe
-and prompt. Timer callbacks retain acquisition/transfer context values while
-dropping request cancellation. Concurrent records can arrive out of order; use
-revision to correlate them. Logs are diagnostic, not a durable audit stream;
-lazy deadline cleanup may coalesce reservation-expiry diagnostics.
+Resolvers/handlers run outside the mutex, before the corresponding `OnEvent`,
+and must be concurrency-safe and prompt. Timer/lazy-expiry events retain the
+acquisition/transfer context values while dropping request cancellation. Use
+sequence to order concurrent records. Logs remain diagnostic, not durable audit
+storage; both lazy and timer expiry produce the same lifecycle event.
+
+## Migrating from v0.1.x
+
+- Use `errors.Is`, not equality with sentinels: arbitration errors now include
+  `ConflictError` snapshots.
+- Reservation cancellation/replacement/shutdown promptly unblocks `Wait`, even
+  before old-holder cleanup. Only a successful `Wait` establishes readiness.
+- A ready reservation wins concurrent caller cancellation. Explicitly `Cancel`
+  when abandoning it; waiting-time cancellation still withdraws it.
+- Claim reads that discover expiry now persist that cause and signal `Done`.
+- Diagnostics use typed reservation lifecycle names; former
+  `transfer_requested`/`transfer_ready`/`transfer_failed` log names are replaced.
+- AcquireOptions JSON omits `Token`; transport it explicitly over an authorized
+  channel. Do not use the options struct as a wire payload for credentials.
 
 ## Validation and performance
 
@@ -203,10 +274,12 @@ Executable examples show application integration. Statement coverage does not
 measure every possible interleaving or prove external-system correctness.
 
 Benchmarks measure ordinary/timed acquire-release, occupied rejection, Check,
-Observe, contention, reservation-based transfer, and JSON logging overhead.
+Observe, contention, reservation-based transfer, JSON logging, event callbacks,
+and the optional work-context helper. Structured rejection snapshots now allocate;
+they trade fast sentinel-only rejection for a consistent diagnostic state.
 The contended benchmark measures **attempts**, including rejected acquisitions;
 it does not report successful-operation latency. Benchmarks exclude network,
 storage, and device execution. Compare results on the same host and Go version.
 
-See the [initial measured baseline](docs/benchmarks.md) for environment, results,
+See the [measured baselines and v0.2 comparison](docs/benchmarks.md) for environment, results,
 and interpretation limits.

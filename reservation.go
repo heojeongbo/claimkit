@@ -3,19 +3,17 @@ package claimkit
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"log/slog"
 	"maps"
 	"time"
 )
 
-// Reservation is a single-use handoff with an optional Owner binding. Token explicitly
-// exposes its bearer capability for transport; keep it confidential. Default
-// formatting, slog, and JSON encoding do not include the token. Cancelling an
-// abandoned reservation is optional: it expires after its TTL once available.
-// Retain the pointer returned by BeginTransfer or Transfer for lifecycle calls.
+// Reservation is a single-use handoff with an optional Owner binding. Token
+// exposes its bearer capability for transport; keep it confidential. Formatting,
+// slog and JSON omit the token. Retain the returned pointer for lifecycle calls.
 type Reservation struct {
-	// The handle is immutable so value-receiver redaction can safely copy it
-	// while the prior holder releases and starts the reservation's timer.
+	// Immutable handle permits concurrent value-receiver redaction.
 	*reservationState
 }
 
@@ -26,9 +24,10 @@ type reservationState struct {
 	ttl          time.Duration
 	timer        *time.Timer
 	logctx       context.Context
-	previous     *Claim
-	previousInfo *ClaimInfo
-	bound        bool
+	previousInfo *ClaimInfo // immutable, detached at creation
+	ready        chan struct{}
+	done         chan struct{}
+	cause        error
 }
 
 func (p Reservation) String() string       { return "claimkit.Reservation([REDACTED])" }
@@ -38,39 +37,47 @@ func (p Reservation) LogValue() slog.Value { return slog.StringValue(p.String())
 // Token returns the secret capability. Never include it in logs or snapshots.
 func (p *Reservation) Token() string { return p.token }
 
-// Info returns a detached view of the reservation.
-func (p *Reservation) Info() ReservationInfo {
+// Done closes on cancellation, replacement, consumption, expiration or shutdown.
+// It does not mean the previous holder finished cleanup; use Wait for readiness.
+func (p *Reservation) Done() <-chan struct{} { return p.done }
+
+// Err returns nil while waiting or ready. Otherwise it matches ErrReservationLost
+// and the specific terminal cause via errors.Is, including successful consumption.
+func (p *Reservation) Err() error {
+	var events []emission
 	p.r.mu.Lock()
-	defer p.r.mu.Unlock()
+	defer p.r.finish(&events)
+	p.r.expireReservationLocked(time.Now(), &events)
+	return p.cause
+}
+
+// Info returns a detached view, including terminal status after removal.
+func (p *Reservation) Info() ReservationInfo {
+	var events []emission
+	p.r.mu.Lock()
+	defer p.r.finish(&events)
+	p.r.expireReservationLocked(time.Now(), &events)
 	return p.info
 }
 
-// Cancel withdraws this reservation only. It never revives a revoked holder or
-// affects a replacement reservation. It returns true if it removed a live one.
+// Cancel withdraws only this reservation; it never releases the previous holder
+// or affects a replacement. It returns true exactly once for a live reservation.
 func (p *Reservation) Cancel(ctx context.Context) bool {
 	r := p.r
+	var events []emission
 	r.mu.Lock()
-	r.expireReservationLocked(time.Now())
+	defer r.finish(&events)
+	r.expireReservationLocked(time.Now(), &events)
 	if r.pending != p {
-		r.mu.Unlock()
 		return false
 	}
-	r.clearReservationLocked()
-	r.notifyLocked()
-	revision := r.revision
-	r.mu.Unlock()
-	r.log(ctx, "reservation_cancelled", "", revision, nil, p.info.Owner, "")
+	p.endLocked(ctx, ReservationCancelled, EventReservationCancelled, ErrReservationCancelled, &events)
 	return true
 }
 
-// Transfer reserves the next acquisition for next BEFORE revoking the current
-// holder, and returns only after that holder releases. The caller passes Token
-// to Acquire with the same Owner. ttl starts at release, not at the revoke
-// request. A resource that is already free is reserved immediately.
-//
-// Concurrent transfers fail with ErrReserved instead of silently replacing the
-// winner's reservation. Cancellation withdraws only this call's reservation;
-// revocation remains in effect. Authorization belongs to the application.
+// Transfer reserves acquisition for next before revoking the holder and waits
+// for cleanup. TTL starts at release. Cancellation withdraws only this call's
+// reservation; revocation remains in effect. Authorization is application-owned.
 func (r *Resource) Transfer(ctx context.Context, next Owner, ttl time.Duration, reason string) (*Reservation, error) {
 	p, err := r.BeginTransfer(ctx, TransferOptions{Next: &next, TTL: ttl, Reason: reason})
 	if err != nil {
@@ -82,53 +89,66 @@ func (r *Resource) Transfer(ctx context.Context, next Owner, ttl time.Duration, 
 	return p, nil
 }
 
-// BeginTransfer installs a reservation and signals the current holder without
-// waiting for cleanup. Call Wait before advertising the resource as available.
-// This split lets transport adapters install or invoke their teardown hooks
-// after the reservation is in place. Authorization belongs to the application.
-func (r *Resource) BeginTransfer(ctx context.Context, opts TransferOptions) (*Reservation, error) {
+// BeginTransfer installs a reservation and signals the holder without waiting.
+// ExpectedClaimID is compared atomically; Replace explicitly supersedes a pending
+// reservation. Neither option releases the holder. Call Wait before advertising
+// readiness. Authorization belongs to the application.
+func (r *Resource) BeginTransfer(ctx context.Context, opts TransferOptions) (reservation *Reservation, err error) {
+	var events []emission
+	r.mu.Lock()
+	defer r.finish(&events)
+	defer func() {
+		if err != nil {
+			r.recordLocked(ctx, EventTransferRejected, r.current, r.pending, Owner{}, opts.ExpectedClaimID, err, &events)
+		}
+	}()
 	if opts.TTL <= 0 {
 		return nil, ErrInvalidTTL
 	}
-	r.mu.Lock()
 	if err := ctx.Err(); err != nil {
-		r.mu.Unlock()
 		return nil, err
 	}
 	if r.closed {
-		r.mu.Unlock()
 		return nil, ErrClosed
 	}
-	r.expireReservationLocked(time.Now())
-	if r.pending != nil && !opts.Replace {
-		r.mu.Unlock()
-		return nil, ErrReserved
+	r.expireLocked(&events)
+	if !r.matchesLocked(opts.ExpectedClaimID) {
+		return nil, r.conflictLocked("transfer", opts.ExpectedClaimID, ErrConflict)
 	}
-	r.clearReservationLocked()
-	p := &Reservation{reservationState: &reservationState{r: r, token: rand.Text(), ttl: opts.TTL, logctx: context.WithoutCancel(ctx), previous: r.current}}
+	if r.pending != nil {
+		if !opts.Replace {
+			return nil, r.conflictLocked("transfer", opts.ExpectedClaimID, ErrReserved)
+		}
+		r.pending.endLocked(ctx, ReservationReplaced, EventReservationReplaced, ErrReservationReplaced, &events)
+	}
+	p := &Reservation{reservationState: &reservationState{
+		r: r, token: rand.Text(), ttl: opts.TTL, logctx: context.WithoutCancel(ctx),
+		ready: make(chan struct{}), done: make(chan struct{}),
+		info: ReservationInfo{
+			ID: rand.Text(), State: ReservationWaiting, CreatedAt: time.Now(), Reason: opts.Reason,
+		},
+	}}
 	if opts.Next != nil {
-		p.bound = true
+		p.info.OwnerBound = true
 		p.info.Owner = *opts.Next
 	}
-	p.info.OwnerBound = p.bound
-	r.pending = p
 	c := r.current
-	if c == nil {
-		p.armLocked()
-	} else {
+	if c != nil {
 		info := c.infoLocked()
 		p.previousInfo = &info
-		c.invalidateLocked(ErrRevoked, opts.Reason)
 	}
+	r.pending = p
 	r.notifyLocked()
-	revision := r.revision
-	r.mu.Unlock()
-	r.log(ctx, "transfer_requested", "", revision, nil, p.info.Owner, opts.Reason)
+	r.recordLocked(ctx, EventReservationCreated, c, p, Owner{}, opts.ExpectedClaimID, nil, &events)
+	if c == nil {
+		p.armLocked(&events)
+	} else {
+		c.invalidateLocked(ctx, ErrRevoked, CauseRevoked, opts.Reason, EventRevoked, time.Now(), &events)
+	}
 	return p, nil
 }
 
-// Previous returns the holder captured atomically when the reservation was
-// installed, or nil if the resource was free. The snapshot is a detached copy.
+// Previous returns the holder captured at installation, or nil if free.
 func (p *Reservation) Previous() *ClaimInfo {
 	if p.previousInfo == nil {
 		return nil
@@ -138,68 +158,66 @@ func (p *Reservation) Previous() *ClaimInfo {
 	return &info
 }
 
-// Wait waits for the previous holder to Release and checks that this reservation
-// is still live. On timeout it withdraws only this reservation; revocation remains
-// in effect. A replaced, consumed, cancelled, or expired reservation returns
-// ErrReservationLost after cleanup. Concurrent calls are safe, but any caller's
-// timeout can cancel the shared reservation. Prefer one lifecycle owner.
+// Wait succeeds when the prior holder releases and this reservation is live.
+// Terminal reservations return promptly, even while the prior holder is cleaning
+// up. A waiting caller's context cancellation withdraws this shared reservation
+// and returns ErrNotReleased plus the context error. Readiness wins concurrent
+// cancellation. Prefer one lifecycle owner; other observers can use Done/Info.
 func (p *Reservation) Wait(ctx context.Context) error {
-	var err error
-	if p.previous != nil {
-		err = waitReleased(ctx, p.previous.released)
-	} else {
-		err = ctx.Err()
+	select {
+	case <-p.ready:
+	case <-p.done:
+	case <-ctx.Done():
 	}
 	r := p.r
+	var events []emission
 	r.mu.Lock()
-	r.expireReservationLocked(time.Now())
-	if err != nil {
-		if r.pending == p {
-			r.clearReservationLocked()
-			r.notifyLocked()
-		}
-	} else if r.pending != p {
-		err = ErrReservationLost
+	defer r.finish(&events)
+	r.expireReservationLocked(time.Now(), &events)
+	if p.cause != nil {
+		return p.cause
 	}
-	revision := r.revision
-	r.mu.Unlock()
-	if err != nil {
-		r.log(ctx, "transfer_failed", "", revision, err, p.info.Owner, "")
-		return err
+	if p.info.State == ReservationReady {
+		return nil
 	}
-	r.log(ctx, "transfer_ready", "", revision, nil, p.info.Owner, "")
-	return nil
+	p.endLocked(ctx, ReservationCancelled, EventReservationCancelled, ErrReservationCancelled, &events)
+	return errors.Join(ErrNotReleased, ctx.Err())
 }
 
-func (p *Reservation) armLocked() {
-	p.info.ExpiresAt = time.Now().Add(p.ttl)
+func (p *Reservation) armLocked(events *[]emission) {
+	p.info.State, p.info.ReadyAt = ReservationReady, time.Now()
+	p.info.ExpiresAt = p.info.ReadyAt.Add(p.ttl)
+	close(p.ready)
 	p.timer = time.AfterFunc(p.ttl, func() {
 		r := p.r
+		var events []emission
 		r.mu.Lock()
-		changed := r.pending == p && r.expireReservationLocked(time.Now())
-		revision := r.revision
-		r.mu.Unlock()
-		if changed {
-			r.log(p.logctx, "reservation_expired", "", revision, nil, p.info.Owner, "")
-		}
+		defer r.finish(&events)
+		r.expireReservationLocked(time.Now(), &events)
 	})
+	p.r.notifyLocked()
+	p.r.recordLocked(p.logctx, EventReservationReady, nil, p, Owner{}, "", nil, events)
 }
 
-func (r *Resource) expireReservationLocked(now time.Time) bool {
+func (p *Reservation) endLocked(ctx context.Context, status ReservationStatus, kind EventKind, cause error, events *[]emission) {
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	p.info.State, p.info.EndedAt = status, time.Now()
+	if status == ReservationExpired {
+		p.info.EndedAt = p.info.ExpiresAt
+	}
+	p.cause = errors.Join(ErrReservationLost, cause)
+	close(p.done)
+	p.r.pending = nil
+	p.r.notifyLocked()
+	p.r.recordLocked(ctx, kind, nil, p, Owner{}, "", nil, events)
+}
+
+func (r *Resource) expireReservationLocked(now time.Time, events *[]emission) {
 	p := r.pending
 	if p == nil || p.info.ExpiresAt.IsZero() || now.Before(p.info.ExpiresAt) {
-		return false
+		return
 	}
-	r.clearReservationLocked()
-	r.notifyLocked()
-	return true
-}
-
-func (r *Resource) clearReservationLocked() {
-	if r.pending != nil {
-		if r.pending.timer != nil {
-			r.pending.timer.Stop()
-		}
-		r.pending = nil
-	}
+	p.endLocked(p.logctx, ReservationExpired, EventReservationExpired, ErrExpired, events)
 }

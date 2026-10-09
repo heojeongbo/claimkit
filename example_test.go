@@ -2,6 +2,7 @@ package claimkit_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -78,4 +79,66 @@ func ExampleResource_Observe() {
 	// Output:
 	// initially occupied: false
 	// current owner: worker
+}
+
+func ExampleClaim_Context() {
+	ctx := context.Background()
+	r := claimkit.New("jobs/export", claimkit.Options{})
+	c, err := r.Acquire(ctx, claimkit.Owner{ID: "worker"}, claimkit.AcquireOptions{})
+	if err != nil {
+		panic(err)
+	}
+	work, cancel := c.Context(ctx)
+	defer cancel()
+	joined := make(chan struct{})
+	go func() {
+		<-work.Done()
+		// Finish work cleanup before acknowledging release.
+		c.Release(ctx)
+		close(joined)
+	}()
+	if err := r.Revoke(ctx, "operator stopped export"); err != nil {
+		panic(err)
+	}
+	<-joined
+	fmt.Println("cause:", context.Cause(work))
+	fmt.Println("cleanup acknowledged:", !c.Info().ReleasedAt.IsZero())
+	// Output:
+	// cause: claimkit: claim was revoked
+	// cleanup acknowledged: true
+}
+
+func ExampleConflictError() {
+	ctx := context.Background()
+	r := claimkit.New("documents/42", claimkit.Options{})
+	c, err := r.Acquire(ctx, claimkit.Owner{ID: "alice"}, claimkit.AcquireOptions{})
+	if err != nil {
+		panic(err)
+	}
+	defer c.Release(ctx)
+	_, err = r.Acquire(ctx, claimkit.Owner{ID: "bob"}, claimkit.AcquireOptions{})
+	var conflict *claimkit.ConflictError
+	if errors.As(err, &conflict) {
+		fmt.Println("occupied:", errors.Is(err, claimkit.ErrOccupied))
+		fmt.Println("holder at rejection:", conflict.Snapshot().Claim.Owner.ID)
+	}
+	// Output:
+	// occupied: true
+	// holder at rejection: alice
+}
+
+func ExampleOptions_OnEvent() {
+	ctx := context.Background()
+	r := claimkit.New("resource", claimkit.Options{OnEvent: func(_ context.Context, e claimkit.Event) {
+		fmt.Println(e.Sequence, e.Kind)
+	}})
+	c, err := r.Acquire(ctx, claimkit.Owner{}, claimkit.AcquireOptions{})
+	if err != nil {
+		panic(err)
+	}
+	c.Release(ctx)
+	c.Release(ctx) // idempotent release does not repeat the event
+	// Output:
+	// 1 acquired
+	// 2 released
 }

@@ -80,3 +80,38 @@ Median of three GOMAXPROCS=4 runs (other host workloads may affect timings):
 | Contended | 405.5 | 504 | 4 |
 | Transfer | 884.7 | 1192 | 15 |
 | Logging | 2356 | 1088 | 11 |
+
+## v0.2.0 lifecycle and extension APIs
+
+Measured in the same Linux arm64 devcontainer, Go 1.26.4, Apple M4 Pro,
+GOMAXPROCS=4. Median of three 200 ms samples; these are local microbenchmarks.
+
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | ---: | ---: | ---: |
+| AcquireRelease | 447.3 | 784 | 7 |
+| AcquireReleaseTTL | 656.6 | 912 | 9 |
+| Occupied | 156.1 | 288 | 2 |
+| Check | 5.677 | 0 | 0 |
+| Observe | 112.2 | 192 | 1 |
+| Contended | 285.2 | 407 | 3 |
+| Transfer | 1346 | 1936 | 22 |
+| Logging | 3419 | 2401 | 15 |
+| Events | 1068 | 1520 | 11 |
+| ClaimContext | 931.9 | 1520 | 18 |
+
+The default path does not allocate event payloads or a work-context bridge.
+The optional no-op OnEvent benchmark measures snapshot/callback overhead; the
+Context benchmark acquires, derives/detaches one context, and releases. It does
+not include application cleanup or asynchronous work cancellation latency.
+
+Compared with v0.1.1, claims retain terminal timestamps/cause and optional context
+state. Reservations retain public IDs, readiness/termination channels and final
+status. These make transfer more expensive. Occupied rejection now allocates a
+ConflictError and detached incumbent snapshot (2 allocations without metadata),
+instead of returning a bare sentinel. Metadata adds copying cost. This is an
+intentional cost of atomic diagnostics. Untimed Check remains allocation-free.
+
+Logging includes additional public correlation fields and shares typed event
+snapshots; the benchmark writes to io.Discard. Real exporters and event sinks
+add their own latency. Event ordering and observability are measured separately
+from external job or device performance.

@@ -8,16 +8,20 @@ import (
 )
 
 var (
-	ErrOccupied        = errors.New("claimkit: resource is occupied")
-	ErrReserved        = errors.New("claimkit: resource is reserved")
-	ErrInvalidToken    = errors.New("claimkit: reservation token is invalid")
-	ErrInvalidTTL      = errors.New("claimkit: TTL must be positive")
-	ErrRevoked         = errors.New("claimkit: claim was revoked")
-	ErrExpired         = errors.New("claimkit: claim expired")
-	ErrReleased        = errors.New("claimkit: claim was released")
-	ErrClosed          = errors.New("claimkit: resource is closed")
-	ErrNotReleased     = errors.New("claimkit: holder has not released")
-	ErrReservationLost = errors.New("claimkit: reservation ended before handoff completed")
+	ErrOccupied             = errors.New("claimkit: resource is occupied")
+	ErrReserved             = errors.New("claimkit: resource is reserved")
+	ErrInvalidToken         = errors.New("claimkit: reservation token is invalid")
+	ErrInvalidTTL           = errors.New("claimkit: TTL must be positive")
+	ErrRevoked              = errors.New("claimkit: claim was revoked")
+	ErrExpired              = errors.New("claimkit: claim expired")
+	ErrReleased             = errors.New("claimkit: claim was released")
+	ErrClosed               = errors.New("claimkit: resource is closed")
+	ErrNotReleased          = errors.New("claimkit: holder has not released")
+	ErrConflict             = errors.New("claimkit: claim changed")
+	ErrReservationCancelled = errors.New("claimkit: reservation cancelled")
+	ErrReservationReplaced  = errors.New("claimkit: reservation replaced")
+	ErrReservationConsumed  = errors.New("claimkit: reservation consumed")
+	ErrReservationLost      = errors.New("claimkit: reservation ended before handoff completed")
 )
 
 // Owner is application-defined identity. Session distinguishes concurrent uses
@@ -34,6 +38,8 @@ type Owner struct {
 // neither is called with the resource mutex held. They should return promptly.
 type Options struct {
 	Logger func(context.Context) *slog.Logger
+	// OnEvent receives detached transition/denial events; see Event for delivery semantics.
+	OnEvent func(context.Context, Event)
 }
 
 // AcquireOptions describes one acquisition. TTL zero disables expiration;
@@ -42,12 +48,12 @@ type Options struct {
 // callers must not mutate the input map concurrently with Acquire.
 //
 // Token is a secret, single-use reservation capability. It must match both the
-// resource's live reservation and any configured Owner binding. A supplied stale token is rejected even
-// when the resource is free. Omit Token for ordinary acquisition.
+// resource's live reservation and any configured Owner binding. A supplied
+// stale token is rejected even when the resource is free. Omit Token for ordinary acquisition.
 type AcquireOptions struct {
 	TTL      time.Duration
 	Metadata map[string]string
-	Token    string
+	Token    string `json:"-"`
 }
 
 // ClaimInfo is a detached snapshot, safe for the caller to modify. ID is a public
@@ -59,6 +65,8 @@ type ClaimInfo struct {
 	AcquiredAt time.Time         `json:"acquired_at"`
 	ReleasedAt time.Time         `json:"released_at,omitempty"`
 	ExpiresAt  time.Time         `json:"expires_at,omitempty"`
+	EndedAt    time.Time         `json:"ended_at,omitempty"`
+	Cause      Cause             `json:"cause,omitempty"`
 	Revoked    bool              `json:"revoked"`
 	Reason     string            `json:"reason,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
@@ -68,9 +76,15 @@ type ClaimInfo struct {
 // ExpiresAt is zero while the current holder is still cleaning up. Its TTL
 // starts only after that holder releases.
 type ReservationInfo struct {
-	OwnerBound bool      `json:"owner_bound"`
-	Owner      Owner     `json:"owner"`
-	ExpiresAt  time.Time `json:"expires_at,omitempty"`
+	ID         string            `json:"id"`
+	State      ReservationStatus `json:"state"`
+	CreatedAt  time.Time         `json:"created_at"`
+	ReadyAt    time.Time         `json:"ready_at,omitempty"`
+	EndedAt    time.Time         `json:"ended_at,omitempty"`
+	Reason     string            `json:"reason,omitempty"`
+	OwnerBound bool              `json:"owner_bound"`
+	Owner      Owner             `json:"owner"`
+	ExpiresAt  time.Time         `json:"expires_at,omitempty"`
 }
 
 // Snapshot is a consistent view of one resource. Revision increases on changes
@@ -89,8 +103,43 @@ type Snapshot struct {
 // pending reservation. Superseded waiters cannot withdraw the replacement.
 // Neither option changes the rule that the previous holder must Release.
 type TransferOptions struct {
-	Next    *Owner
-	TTL     time.Duration
-	Reason  string
-	Replace bool
+	// ExpectedClaimID, when non-empty, must match the current claim under the lock.
+	ExpectedClaimID string
+	Next            *Owner
+	TTL             time.Duration
+	Reason          string
+	Replace         bool
 }
+
+// RevokeOptions optionally compares the public claim ID before requesting cleanup.
+// Empty ExpectedClaimID preserves unconditional Revoke behavior. A mismatch,
+// including a now-free resource, returns ErrConflict without revoking anyone.
+type RevokeOptions struct {
+	Reason          string
+	ExpectedClaimID string
+}
+
+// Cause identifies the first terminal condition. Empty means still active.
+// ReleasedAt separately identifies when cleanup finished and ownership was freed.
+type Cause string
+
+const (
+	CauseReleased Cause = "released"
+	CauseRevoked  Cause = "revoked"
+	CauseExpired  Cause = "expired"
+	CauseClosed   Cause = "closed"
+)
+
+// ReservationStatus distinguishes readiness from terminal states. Termination
+// never releases the previous holder; cleanup remains that holder's obligation.
+type ReservationStatus string
+
+const (
+	ReservationWaiting   ReservationStatus = "waiting"
+	ReservationReady     ReservationStatus = "ready"
+	ReservationConsumed  ReservationStatus = "consumed"
+	ReservationCancelled ReservationStatus = "cancelled"
+	ReservationReplaced  ReservationStatus = "replaced"
+	ReservationExpired   ReservationStatus = "expired"
+	ReservationClosed    ReservationStatus = "closed"
+)

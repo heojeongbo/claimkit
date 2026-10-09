@@ -91,3 +91,25 @@ func BenchmarkLogging(b *testing.B) {
 		c.Release(ctx)
 	}
 }
+
+func BenchmarkEvents(b *testing.B) {
+	r := New("resource", Options{OnEvent: func(context.Context, Event) {}})
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		c, _ := r.Acquire(ctx, alice, AcquireOptions{})
+		c.Release(ctx)
+	}
+}
+
+func BenchmarkClaimContext(b *testing.B) {
+	r := New("resource", Options{})
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		c, _ := r.Acquire(ctx, alice, AcquireOptions{})
+		_, cancel := c.Context(ctx)
+		cancel()
+		c.Release(ctx)
+	}
+}

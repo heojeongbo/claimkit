@@ -605,7 +605,7 @@ func TestTwoPhaseTransferAndReplacement(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		wantErr(t, first.Wait(ctx), ErrNotReleased)
+		wantErr(t, first.Wait(ctx), ErrReservationReplaced)
 		if first.Cancel(t.Context()) {
 			t.Fatal("superseded reservation removed successor")
 		}
@@ -631,7 +631,10 @@ func TestUnboundReservationAndAbandonedFreeTransfer(t *testing.T) {
 	wantErr(t, err, nil)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	wantErr(t, p.Wait(ctx), context.Canceled)
+	wantErr(t, p.Wait(ctx), nil) // readiness wins cancellation; explicitly abandon it
+	if !p.Cancel(ctx) {
+		t.Fatal("ready reservation not cancelled")
+	}
 	s, _ := r.Observe()
 	if s.Reservation != nil {
 		t.Fatal("abandoned free transfer left a reservation")
