@@ -222,7 +222,7 @@ r := claimkit.New("resource", claimkit.Options{Logger: log.From})
 For plain slog, supply `func(context.Context) *slog.Logger { return logger }`.
 Nil disables logging. Records include component, resource, event, sequence,
 revision, occurrence time, public claim/reservation IDs, holder and requester
-identity/session, expected claim ID, reason, and error. Renewals and request
+identity/session, expected claim ID, reason, and error when present. Renewals and request
 denials are debug-level; ordinary lifecycle events are info-level; claim
 invalidation (revocation, expiry, shutdown) warns. Metadata and reservation
 capabilities are never logged by the library.
