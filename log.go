@@ -36,11 +36,16 @@ func (r *Resource) log(ctx context.Context, e Event) {
 			reason = e.Reservation.Reason
 		}
 	}
-	l.LogAttrs(ctx, level, "claimkit "+string(e.Kind),
+	attrs := []slog.Attr{
 		slog.String("component", "claimkit"), slog.String("resource", e.Resource), slog.String("event", string(e.Kind)),
 		slog.Uint64("sequence", e.Sequence), slog.Uint64("revision", e.Revision), slog.Time("occurred_at", e.At),
 		slog.String("claim_id", claimID), slog.String("reservation_id", reservationID),
 		slog.String("owner_id", owner.ID), slog.String("session", owner.Session),
 		slog.String("requester_id", e.RequestedOwner.ID), slog.String("requester_session", e.RequestedOwner.Session),
-		slog.String("expected_claim_id", e.ExpectedClaimID), slog.String("reason", reason), slog.Any("error", e.Err))
+		slog.String("expected_claim_id", e.ExpectedClaimID), slog.String("reason", reason),
+	}
+	if e.Err != nil {
+		attrs = append(attrs, slog.Any("error", e.Err))
+	}
+	l.LogAttrs(ctx, level, "claimkit "+string(e.Kind), attrs...)
 }
